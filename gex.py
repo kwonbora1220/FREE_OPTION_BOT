@@ -6,15 +6,14 @@ Yahoo Finance 무료 옵션체인 + 자체 Black-Scholes Greeks 기반 GEX.
 
 핵심:
 - OptionCollector.collect_one_day() 사용
-- 존재하지 않는 collect() 호출 금지
-- 현재 Collector / Normalizer 구조와 직접 연결
+- 미국 동부시간 기준 만기 유지
+- DTE=0 지원
 - CALL GEX / PUT GEX / NET GEX
-- GEX Flip
+- 현재가 주변의 GEX Flip 우선 탐색
 - GEX Extremes
 - TOP GEX Strikes
 - Current Price 주변 GEX
 - Data Quality
-- DTE=0 지원
 
 주의:
 GEX는 Gamma × Open Interest 기반의 구조적 추정치이며
@@ -38,12 +37,33 @@ from option_collector import OptionCollector
 
 CONTRACT_MULTIPLIER = 100
 
-# GEX 계산에서 너무 먼 행을 제외할지 여부
-# False = Collector가 가져온 전체 chain 사용
+# 전체 옵션체인을 GEX 계산에 사용
 FILTER_TO_NEAR_SPOT = False
 
-# FILTER_TO_NEAR_SPOT=True일 때 현재가 대비 범위
+# FILTER_TO_NEAR_SPOT=True일 경우
 SPOT_RANGE_PERCENT = 0.50
+
+# ------------------------------------------------------------
+# GEX FLIP CONFIG
+# ------------------------------------------------------------
+
+# GEX Flip을 찾을 때 현재가에서 너무 먼 strike를 제외한다.
+#
+# 예:
+# 현재가 220
+# FLIP_SEARCH_RANGE_PERCENT = 0.20
+#
+# => 176 ~ 264 범위에서만 Flip 탐색
+#
+# 전체 GEX 계산에는 영향을 주지 않는다.
+FLIP_SEARCH_RANGE_PERCENT = 0.20
+
+# 현재가 주변의 실제 strike 구조를 우선한다.
+# True 권장.
+USE_LOCAL_FLIP_SEARCH = True
+
+# 현재가 주변 몇 개 strike를 Flip 후보로 사용할지
+LOCAL_FLIP_STRIKE_COUNT = 21
 
 
 # ============================================================
@@ -231,10 +251,8 @@ def prepare_gex_data(
     #
     # Gamma × OI × 100 × Spot² × 0.01
     #
-    # 단위는 근사적인 달러 GEX.
-    #
-    # CALL = +
-    # PUT  = -
+    # CALL = positive
+    # PUT  = negative
     #
     # 실제 dealer positioning을 의미하지 않음.
     # --------------------------------------------------------
@@ -311,30 +329,6 @@ def aggregate_by_strike(
 
         return pd.DataFrame()
 
-    grouped = (
-        df.groupby(
-            "strike",
-            as_index=False,
-        )
-        .agg(
-            call_gex=(
-                "gex",
-                lambda x:
-                    float(x.sum())
-            ),
-            put_gex_raw=(
-                "gex",
-                lambda x:
-                    float(x.sum())
-            ),
-        )
-    )
-
-    # --------------------------------------------------------
-    # 위 aggregation은 option type을 분리하지 않으므로
-    # 정확한 CALL / PUT aggregation을 별도로 계산한다.
-    # --------------------------------------------------------
-
     calls = (
         df[
             df["option_type"]
@@ -373,16 +367,19 @@ def aggregate_by_strike(
             )
         )
 
-        put_gex = safe_float(
+        put_gex_abs = safe_float(
             puts.get(
                 strike,
                 0.0,
             )
         )
 
+        # PUT GEX는 표시할 때 음수
+        put_gex = -put_gex_abs
+
         net_gex = (
             call_gex
-            - put_gex
+            - put_gex_abs
         )
 
         rows.append(
@@ -394,7 +391,7 @@ def aggregate_by_strike(
                     call_gex,
 
                 "put_gex":
-                    -put_gex,
+                    put_gex,
 
                 "net_gex":
                     net_gex,
@@ -461,6 +458,92 @@ def calculate_total_gex(
 
 
 # ============================================================
+# LOCAL FLIP DATA
+# ============================================================
+
+def get_flip_search_data(
+    strike_df: pd.DataFrame,
+    current_price: float,
+) -> pd.DataFrame:
+
+    if (
+        strike_df is None
+        or strike_df.empty
+    ):
+
+        return pd.DataFrame()
+
+    data = (
+        strike_df.copy()
+        .sort_values("strike")
+        .reset_index(drop=True)
+    )
+
+    # --------------------------------------------------------
+    # 1. 현재가 ±20% 범위
+    # --------------------------------------------------------
+
+    lower_price = (
+        current_price
+        * (
+            1.0
+            - FLIP_SEARCH_RANGE_PERCENT
+        )
+    )
+
+    upper_price = (
+        current_price
+        * (
+            1.0
+            + FLIP_SEARCH_RANGE_PERCENT
+        )
+    )
+
+    local = data[
+        (
+            data["strike"]
+            >= lower_price
+        )
+        & (
+            data["strike"]
+            <= upper_price
+        )
+    ].copy()
+
+    # --------------------------------------------------------
+    # 2. 범위 안에 strike가 너무 적으면
+    #    현재가와 가까운 strike를 사용
+    # --------------------------------------------------------
+
+    if len(local) < 2:
+
+        local = (
+            data.assign(
+                distance=(
+                    data["strike"]
+                    - current_price
+                ).abs()
+            )
+            .sort_values(
+                "distance"
+            )
+            .head(
+                LOCAL_FLIP_STRIKE_COUNT
+            )
+            .sort_values(
+                "strike"
+            )
+            .drop(
+                columns=["distance"]
+            )
+        )
+
+    return local.reset_index(
+        drop=True
+    )
+
+
+# ============================================================
 # GEX FLIP
 # ============================================================
 
@@ -469,52 +552,71 @@ def find_gex_flip(
     current_price: float,
 ) -> dict[str, Any]:
 
+    empty_result = {
+        "flip": None,
+        "lower": None,
+        "upper": None,
+        "method": "NONE",
+    }
+
     if (
         strike_df is None
         or strike_df.empty
     ):
 
-        return {
-            "flip":
-                None,
-
-            "lower":
-                None,
-
-            "upper":
-                None,
-        }
-
-    data = (
-        strike_df
-        .sort_values(
-            "strike"
-        )
-        .reset_index(
-            drop=True
-        )
-    )
+        return empty_result
 
     # --------------------------------------------------------
-    # EXACT ZERO
+    # IMPORTANT
+    #
+    # 전체 chain에서 가장 먼 sign change를 찾지 않는다.
+    #
+    # 현재가 주변에서 먼저 탐색한다.
+    # --------------------------------------------------------
+
+    if USE_LOCAL_FLIP_SEARCH:
+
+        data = get_flip_search_data(
+            strike_df,
+            current_price,
+        )
+
+    else:
+
+        data = (
+            strike_df
+            .sort_values("strike")
+            .reset_index(drop=True)
+        )
+
+    if data.empty:
+
+        return empty_result
+
+    # --------------------------------------------------------
+    # ZERO GEX
+    #
+    # 단순히 $130 같은 먼 strike의
+    # 0 GEX를 Flip으로 잡지 않도록
+    # 현재가에 가까운 zero만 허용.
     # --------------------------------------------------------
 
     zero_rows = data[
-        data["net_gex"] == 0
-    ]
+        data["net_gex"].abs()
+        < 1e-9
+    ].copy()
 
     if not zero_rows.empty:
 
+        zero_rows["distance"] = (
+            zero_rows["strike"]
+            - current_price
+        ).abs()
+        )
+
         closest = (
-            zero_rows.assign(
-                distance=(
-                    zero_rows["strike"]
-                    - current_price
-                ).abs()
-            )
-            .sort_values(
-                "distance"
-            )
+            zero_rows
+            .sort_values("distance")
             .iloc[0]
         )
 
@@ -531,16 +633,19 @@ def find_gex_flip(
 
             "upper":
                 flip,
+
+            "method":
+                "ZERO",
         }
 
     # --------------------------------------------------------
     # SIGN CHANGE
     # --------------------------------------------------------
 
+    candidates = []
+
     previous_strike = None
     previous_gex = None
-
-    candidates = []
 
     for _, row in data.iterrows():
 
@@ -552,23 +657,44 @@ def find_gex_flip(
             row["net_gex"]
         )
 
+        # ----------------------------------------------------
+        # 0은 sign change 판단에서 건너뛴다.
+        # ----------------------------------------------------
+
+        if abs(gex) < 1e-12:
+
+            continue
+
         if previous_gex is not None:
 
-            if (
-                previous_gex < 0
-                and gex > 0
-            ) or (
-                previous_gex > 0
-                and gex < 0
-            ):
+            sign_change = (
+                (
+                    previous_gex < 0
+                    and gex > 0
+                )
+                or
+                (
+                    previous_gex > 0
+                    and gex < 0
+                )
+            )
+
+            if sign_change:
 
                 candidates.append(
-                    (
-                        previous_strike,
-                        strike,
-                        previous_gex,
-                        gex,
-                    )
+                    {
+                        "lower":
+                            previous_strike,
+
+                        "upper":
+                            strike,
+
+                        "gex_lower":
+                            previous_gex,
+
+                        "gex_upper":
+                            gex,
+                    }
                 )
 
         previous_strike = strike
@@ -576,29 +702,19 @@ def find_gex_flip(
 
     if not candidates:
 
-        return {
-            "flip":
-                None,
-
-            "lower":
-                None,
-
-            "upper":
-                None,
-        }
+        return empty_result
 
     # --------------------------------------------------------
-    # CURRENT PRICE에 가장 가까운 FLIP
+    # CURRENT PRICE와 가장 가까운 sign change
     # --------------------------------------------------------
 
-    def distance(candidate):
-
-        lower = candidate[0]
-        upper = candidate[1]
+    def candidate_distance(
+        candidate: dict[str, Any],
+    ) -> float:
 
         midpoint = (
-            lower
-            + upper
+            candidate["lower"]
+            + candidate["upper"]
         ) / 2.0
 
         return abs(
@@ -608,14 +724,24 @@ def find_gex_flip(
 
     candidate = min(
         candidates,
-        key=distance,
+        key=candidate_distance,
     )
 
-    lower = candidate[0]
-    upper = candidate[1]
+    lower = safe_float(
+        candidate["lower"]
+    )
 
-    gex_lower = candidate[2]
-    gex_upper = candidate[3]
+    upper = safe_float(
+        candidate["upper"]
+    )
+
+    gex_lower = safe_float(
+        candidate["gex_lower"]
+    )
+
+    gex_upper = safe_float(
+        candidate["gex_upper"]
+    )
 
     # --------------------------------------------------------
     # LINEAR INTERPOLATION
@@ -635,12 +761,22 @@ def find_gex_flip(
 
     else:
 
+        ratio = (
+            -gex_lower
+            / denominator
+        )
+
+        ratio = max(
+            0.0,
+            min(
+                1.0,
+                ratio,
+            )
+        )
+
         flip = (
             lower
-            + (
-                -gex_lower
-                / denominator
-            )
+            + ratio
             * (
                 upper
                 - lower
@@ -656,6 +792,9 @@ def find_gex_flip(
 
         "upper":
             upper,
+
+        "method":
+            "LOCAL_SIGN_CHANGE",
     }
 
 
@@ -887,8 +1026,12 @@ def get_extremes(
         ]
 
         max_positive = (
-            safe_float(row["strike"]),
-            safe_float(row["net_gex"]),
+            safe_float(
+                row["strike"]
+            ),
+            safe_float(
+                row["net_gex"]
+            ),
         )
 
     if not negative.empty:
@@ -900,8 +1043,12 @@ def get_extremes(
         ]
 
         max_negative = (
-            safe_float(row["strike"]),
-            safe_float(row["net_gex"]),
+            safe_float(
+                row["strike"]
+            ),
+            safe_float(
+                row["net_gex"]
+            ),
         )
 
     return {
@@ -966,7 +1113,10 @@ def print_debug(
 
     if not df.empty:
 
-        if "impliedVolatility" in df.columns:
+        if (
+            "impliedVolatility"
+            in df.columns
+        ):
 
             valid_iv = df[
                 df[
@@ -1024,11 +1174,12 @@ def main():
     )
 
     # --------------------------------------------------------
-    # IMPORTANT
+    # 미국 동부시간 기준 오늘/가장 가까운 만기
     #
-    # 현재 OptionCollector에는 collect()가 없다.
+    # 한국 토요일 8/29
+    # 미국 금요일 8/28
     #
-    # 반드시 collect_one_day() 사용.
+    # => 8/28 만기 DTE=0 정상
     # --------------------------------------------------------
 
     result = (
@@ -1081,10 +1232,8 @@ def main():
         )
     )
 
-    expiration = (
-        result.get(
-            "expiration"
-        )
+    expiration = result.get(
+        "expiration"
     )
 
     dte = result.get(
@@ -1121,7 +1270,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # PREPARE GEX
+    # PREPARE
     # --------------------------------------------------------
 
     gex_df = prepare_gex_data(
@@ -1141,7 +1290,7 @@ def main():
         return
 
     # --------------------------------------------------------
-    # CHECK GAMMA
+    # GAMMA CHECK
     # --------------------------------------------------------
 
     gamma_rows = int(
@@ -1258,6 +1407,10 @@ def main():
 
     print()
 
+    # --------------------------------------------------------
+    # TOTAL
+    # --------------------------------------------------------
+
     print(
         "⚡ TOTAL GEX"
     )
@@ -1318,6 +1471,11 @@ def main():
             f"${flip['lower']:.2f}"
             f" ~ "
             f"${flip['upper']:.2f}"
+        )
+
+        print(
+            f"Method   : "
+            f"{flip['method']}"
         )
 
     # --------------------------------------------------------
