@@ -6,9 +6,11 @@ Yahoo Finance 옵션체인을
 봇 전체에서 사용하는 표준 데이터로 변환한다.
 
 핵심:
-- IV를 decimal 형태로 통일
-- Black-Scholes Greeks 계산
-- DTE=0 만기 옵션도 안정적으로 계산
+- IV decimal normalization
+- 비정상 IV 제거
+- Black-Scholes Greeks
+- DTE=0 지원
+- 미국 동부시간 기준 DTE
 """
 
 from __future__ import annotations
@@ -36,19 +38,23 @@ US_EASTERN = ZoneInfo(
     "America/New_York"
 )
 
-# 만기 당일 계산 안정성을 위한 최소 T
-# 너무 작으면 ATM Gamma가 폭발할 수 있다.
-MIN_TIME_TO_EXPIRY = (
-    1.0 / 365.0
-)
+# DTE=0 안정성
+MIN_TIME_TO_EXPIRY = 1.0 / 365.0
+
+# 모델 계산용 IV 상한
+#
+# 일반적인 NVDA 옵션 분석에서는
+# 300% 이상의 IV는 대부분 데이터 이상치/극단 OTM noise로 취급.
+#
+# GEX 계산에 극단 IV가 들어가는 것을 방지.
+MAX_MODEL_IV = 3.0
 
 
 # ============================================================
-# CURRENT US DATE
+# US DATE
 # ============================================================
 
 def get_us_date() -> date:
-
     return datetime.now(
         US_EASTERN
     ).date()
@@ -63,19 +69,15 @@ def safe_float(
 ) -> float | None:
 
     if value is None:
-
         return None
 
     try:
-
         value = float(value)
 
         if math.isnan(value):
-
             return None
 
         if math.isinf(value):
-
             return None
 
         return value
@@ -84,7 +86,6 @@ def safe_float(
         TypeError,
         ValueError,
     ):
-
         return None
 
 
@@ -96,35 +97,34 @@ def normalize_iv(
     value: Any,
 ) -> float:
 
-    iv = safe_float(
-        value
-    )
+    iv = safe_float(value)
 
     if iv is None or iv <= 0:
-
         return 0.0
 
     """
-    Yahoo / 공급원에 따라
-    다음과 같은 형태가 들어올 수 있다.
+    공급원에 따라 IV가 다음처럼 들어올 수 있다.
 
-        0.36   -> 36%
-        36     -> 36%
-        17.3   -> 17.3%
+    0.235  -> 23.5%
+    23.5   -> 23.5%
+    235    -> 235%
 
-    내부에서는 항상 decimal:
+    내부에서는 항상 decimal.
 
-        0.36
-        0.173
+    0.235
+    0.50
+    1.00
     """
 
+    # 5 이상이면 percentage 형태로 판단
     if iv >= 5.0:
-
         iv = iv / 100.0
 
-    # 비정상적인 IV 방지
-    if iv > 10.0:
+    # 비정상 IV 제거
+    if iv <= 0:
+        return 0.0
 
+    if iv > MAX_MODEL_IV:
         return 0.0
 
     return float(iv)
@@ -157,8 +157,7 @@ def normal_cdf(
         * (
             1.0
             + math.erf(
-                x
-                / math.sqrt(2.0)
+                x / math.sqrt(2.0)
             )
         )
     )
@@ -172,10 +171,12 @@ def calculate_dte(
     expiration: str,
 ) -> int:
 
-    expiration_date = datetime.strptime(
-        str(expiration),
-        "%Y-%m-%d",
-    ).date()
+    expiration_date = (
+        datetime.strptime(
+            str(expiration),
+            "%Y-%m-%d",
+        ).date()
+    )
 
     return (
         expiration_date
@@ -184,7 +185,7 @@ def calculate_dte(
 
 
 # ============================================================
-# BLACK-SCHOLES
+# BLACK-SCHOLES GREEKS
 # ============================================================
 
 def calculate_greeks(
@@ -205,7 +206,6 @@ def calculate_greeks(
         spot <= 0
         or strike <= 0
     ):
-
         return {
             "delta": 0.0,
             "gamma": 0.0,
@@ -213,12 +213,9 @@ def calculate_greeks(
             "theta": 0.0,
         }
 
-    sigma = normalize_iv(
-        iv
-    )
+    sigma = normalize_iv(iv)
 
     if sigma <= 0:
-
         return {
             "delta": 0.0,
             "gamma": 0.0,
@@ -227,12 +224,10 @@ def calculate_greeks(
         }
 
     # --------------------------------------------------------
-    # DTE = 0
+    # DTE=0
     #
-    # 만기 당일에도 Gamma 계산은 필요하지만
-    # T=0을 직접 넣으면 수학적으로 문제가 발생한다.
-    #
-    # 따라서 1일 단위의 안정적인 근사값 사용.
+    # T=0을 직접 사용하면 division by zero 발생.
+    # 따라서 1일을 최소값으로 사용.
     # --------------------------------------------------------
 
     T = max(
@@ -243,9 +238,7 @@ def calculate_greeks(
     r = RISK_FREE_RATE
     q = DIVIDEND_YIELD
 
-    sqrt_T = math.sqrt(
-        T
-    )
+    sqrt_T = math.sqrt(T)
 
     try:
 
@@ -285,17 +278,10 @@ def calculate_greeks(
             "theta": 0.0,
         }
 
-    pdf = normal_pdf(
-        d1
-    )
+    pdf = normal_pdf(d1)
 
-    cdf1 = normal_cdf(
-        d1
-    )
-
-    cdf2 = normal_cdf(
-        d2
-    )
+    cdf1 = normal_cdf(d1)
+    cdf2 = normal_cdf(d2)
 
     # --------------------------------------------------------
     # DELTA
@@ -304,21 +290,15 @@ def calculate_greeks(
     if option_type == "CALL":
 
         delta = (
-            math.exp(
-                -q * T
-            )
+            math.exp(-q * T)
             * cdf1
         )
 
     elif option_type == "PUT":
 
         delta = (
-            math.exp(
-                -q * T
-            )
-            * (
-                cdf1 - 1.0
-            )
+            math.exp(-q * T)
+            * (cdf1 - 1.0)
         )
 
     else:
@@ -330,9 +310,7 @@ def calculate_greeks(
     # --------------------------------------------------------
 
     gamma = (
-        math.exp(
-            -q * T
-        )
+        math.exp(-q * T)
         * pdf
         / (
             spot
@@ -344,14 +322,12 @@ def calculate_greeks(
     # --------------------------------------------------------
     # VEGA
     #
-    # per 1% IV
+    # 1% IV change 기준
     # --------------------------------------------------------
 
     vega = (
         spot
-        * math.exp(
-            -q * T
-        )
+        * math.exp(-q * T)
         * pdf
         * sqrt_T
         / 100.0
@@ -364,9 +340,7 @@ def calculate_greeks(
     first = (
         -(
             spot
-            * math.exp(
-                -q * T
-            )
+            * math.exp(-q * T)
             * pdf
             * sigma
         )
@@ -382,15 +356,11 @@ def calculate_greeks(
             first
             - r
             * strike
-            * math.exp(
-                -r * T
-            )
+            * math.exp(-r * T)
             * cdf2
             + q
             * spot
-            * math.exp(
-                -q * T
-            )
+            * math.exp(-q * T)
             * cdf1
         )
 
@@ -400,20 +370,12 @@ def calculate_greeks(
             first
             + r
             * strike
-            * math.exp(
-                -r * T
-            )
-            * normal_cdf(
-                -d2
-            )
+            * math.exp(-r * T)
+            * normal_cdf(-d2)
             - q
             * spot
-            * math.exp(
-                -q * T
-            )
-            * normal_cdf(
-                -d1
-            )
+            * math.exp(-q * T)
+            * normal_cdf(-d1)
         )
 
     else:
@@ -424,24 +386,16 @@ def calculate_greeks(
 
     return {
         "delta":
-            safe_float(
-                delta
-            ) or 0.0,
+            safe_float(delta) or 0.0,
 
         "gamma":
-            safe_float(
-                gamma
-            ) or 0.0,
+            safe_float(gamma) or 0.0,
 
         "vega":
-            safe_float(
-                vega
-            ) or 0.0,
+            safe_float(vega) or 0.0,
 
         "theta":
-            safe_float(
-                theta
-            ) or 0.0,
+            safe_float(theta) or 0.0,
     }
 
 
@@ -458,7 +412,6 @@ def normalize_options(
         df is None
         or df.empty
     ):
-
         return pd.DataFrame()
 
     result = df.copy()
@@ -468,33 +421,21 @@ def normalize_options(
     # --------------------------------------------------------
 
     required_columns = [
-
         "contractSymbol",
-
         "expiration",
-
         "option_type",
-
         "strike",
-
         "lastPrice",
-
         "bid",
-
         "ask",
-
         "volume",
-
         "openInterest",
-
         "impliedVolatility",
-
     ]
 
     for column in required_columns:
 
         if column not in result.columns:
-
             result[column] = None
 
     # --------------------------------------------------------
@@ -502,21 +443,13 @@ def normalize_options(
     # --------------------------------------------------------
 
     numeric_columns = [
-
         "strike",
-
         "lastPrice",
-
         "bid",
-
         "ask",
-
         "volume",
-
         "openInterest",
-
         "impliedVolatility",
-
     ]
 
     for column in numeric_columns:
@@ -548,14 +481,12 @@ def normalize_options(
             calculate_dte(
                 expiration
             )
-            if pd.notna(
-                expiration
-            )
+            if pd.notna(expiration)
             else 0
     )
 
     # --------------------------------------------------------
-    # SPOT
+    # CURRENT PRICE
     # --------------------------------------------------------
 
     if (
@@ -565,9 +496,7 @@ def normalize_options(
 
         result[
             "underlying_price"
-        ] = float(
-            current_price
-        )
+        ] = float(current_price)
 
     elif (
         "underlying_price"
@@ -582,12 +511,24 @@ def normalize_options(
     # IV NORMALIZATION
     # --------------------------------------------------------
 
+    raw_iv = result[
+        "impliedVolatility"
+    ].copy()
+
     result[
         "impliedVolatility"
-    ] = result[
-        "impliedVolatility"
-    ].apply(
+    ] = raw_iv.apply(
         normalize_iv
+    )
+
+    # --------------------------------------------------------
+    # IV VALID FLAG
+    # --------------------------------------------------------
+
+    result["iv_valid"] = (
+        result[
+            "impliedVolatility"
+        ] > 0
     )
 
     # --------------------------------------------------------
@@ -600,10 +541,11 @@ def normalize_options(
     ) / 2.0
 
     invalid_mid = (
-        result["midPrice"]
-        <= 0
-    ) | (
         result["midPrice"].isna()
+        | (
+            result["midPrice"]
+            <= 0
+        )
     )
 
     result.loc[
@@ -633,11 +575,13 @@ def normalize_options(
         and current_price > 0
     ):
 
+        spot = float(
+            current_price
+        )
+
         result["moneyness"] = (
             result["strike"]
-            / float(
-                current_price
-            )
+            / spot
         )
 
         result[
@@ -645,13 +589,9 @@ def normalize_options(
         ] = (
             (
                 result["strike"]
-                - float(
-                    current_price
-                )
+                - spot
             )
-            / float(
-                current_price
-            )
+            / spot
             * 100.0
         )
 
@@ -677,6 +617,10 @@ def normalize_options(
         and current_price > 0
     ):
 
+        spot = float(
+            current_price
+        )
+
         for index, row in result.iterrows():
 
             strike = safe_float(
@@ -689,14 +633,10 @@ def normalize_options(
                 ]
             )
 
-            dte_value = row[
-                "DTE"
-            ]
-
             try:
 
                 dte = int(
-                    dte_value
+                    row["DTE"]
                 )
 
             except (
@@ -710,6 +650,10 @@ def normalize_options(
                 row["option_type"]
             )
 
+            # ------------------------------------------------
+            # invalid data
+            # ------------------------------------------------
+
             if (
                 strike is None
                 or strike <= 0
@@ -720,19 +664,11 @@ def normalize_options(
                 continue
 
             greeks = calculate_greeks(
-
-                spot=float(
-                    current_price
-                ),
-
+                spot=spot,
                 strike=strike,
-
                 iv=iv,
-
                 dte=dte,
-
-                option_type=
-                    option_type,
+                option_type=option_type,
             )
 
             result.at[
@@ -794,20 +730,29 @@ def normalize_options(
         .clip(lower=0)
     )
 
-    result["delta"] = pd.to_numeric(
-        result["delta"],
-        errors="coerce",
-    ).fillna(0)
+    result["delta"] = (
+        pd.to_numeric(
+            result["delta"],
+            errors="coerce",
+        )
+        .fillna(0)
+    )
 
-    result["vega"] = pd.to_numeric(
-        result["vega"],
-        errors="coerce",
-    ).fillna(0)
+    result["vega"] = (
+        pd.to_numeric(
+            result["vega"],
+            errors="coerce",
+        )
+        .fillna(0)
+    )
 
-    result["theta"] = pd.to_numeric(
-        result["theta"],
-        errors="coerce",
-    ).fillna(0)
+    result["theta"] = (
+        pd.to_numeric(
+            result["theta"],
+            errors="coerce",
+        )
+        .fillna(0)
+    )
 
     return result.reset_index(
         drop=True
@@ -870,12 +815,6 @@ def print_normalizer_debug(
         ).sum()
     )
 
-    gamma_ratio = (
-        gamma_rows
-        / rows
-        * 100.0
-    )
-
     print(
         f"Rows           : {rows}"
     )
@@ -887,7 +826,7 @@ def print_normalizer_debug(
 
     print(
         f"Gamma ratio    : "
-        f"{gamma_ratio:.1f}%"
+        f"{gamma_rows / rows * 100:.1f}%"
     )
 
     print(
@@ -900,6 +839,10 @@ def print_normalizer_debug(
         f"{volume_rows}"
     )
 
+    # --------------------------------------------------------
+    # IV RANGE
+    # --------------------------------------------------------
+
     print()
 
     print(
@@ -911,12 +854,16 @@ def print_normalizer_debug(
     )
 
     valid_iv = df[
-        df[
-            "impliedVolatility"
-        ] > 0
+        df["impliedVolatility"] > 0
     ]["impliedVolatility"]
 
-    if not valid_iv.empty:
+    if valid_iv.empty:
+
+        print(
+            "No valid IV"
+        )
+
+    else:
 
         print(
             f"Min IV         : "
@@ -928,16 +875,64 @@ def print_normalizer_debug(
             f"{valid_iv.max():.4f}"
         )
 
-        print(
-            f"ATM-ish IV     : "
-            f"{valid_iv.median():.4f}"
-        )
+        # ----------------------------------------------------
+        # ATM-ish IV
+        #
+        # 현재가 ±10%만 사용
+        # ----------------------------------------------------
 
-    else:
+        if (
+            "underlying_price"
+            in df.columns
+        ):
 
-        print(
-            "No valid IV"
-        )
+            spot_values = pd.to_numeric(
+                df[
+                    "underlying_price"
+                ],
+                errors="coerce",
+            ).dropna()
+
+            if not spot_values.empty:
+
+                spot = float(
+                    spot_values.iloc[0]
+                )
+
+                atm_iv = df[
+                    (
+                        df["strike"]
+                        >= spot * 0.90
+                    )
+                    & (
+                        df["strike"]
+                        <= spot * 1.10
+                    )
+                    & (
+                        df[
+                            "impliedVolatility"
+                        ] > 0
+                    )
+                ][
+                    "impliedVolatility"
+                ]
+
+                if not atm_iv.empty:
+
+                    print(
+                        f"ATM-ish IV     : "
+                        f"{atm_iv.median():.4f}"
+                    )
+
+                else:
+
+                    print(
+                        "ATM-ish IV     : N/A"
+                    )
+
+    # --------------------------------------------------------
+    # SAMPLE
+    # --------------------------------------------------------
 
     print()
 
@@ -950,21 +945,13 @@ def print_normalizer_debug(
     )
 
     columns = [
-
         "option_type",
-
         "strike",
-
         "openInterest",
-
         "impliedVolatility",
-
         "delta",
-
         "gamma",
-
         "vega",
-
     ]
 
     columns = [
@@ -984,7 +971,7 @@ def print_normalizer_debug(
     )
 
     # --------------------------------------------------------
-    # ATM DEBUG
+    # ATM GAMMA CHECK
     # --------------------------------------------------------
 
     if (
@@ -992,17 +979,17 @@ def print_normalizer_debug(
         in df.columns
     ):
 
-        spot_series = pd.to_numeric(
+        spot_values = pd.to_numeric(
             df[
                 "underlying_price"
             ],
             errors="coerce",
         ).dropna()
 
-        if not spot_series.empty:
+        if not spot_values.empty:
 
             spot = float(
-                spot_series.iloc[0]
+                spot_values.iloc[0]
             )
 
             atm = (
