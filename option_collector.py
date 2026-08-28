@@ -2,11 +2,12 @@
 FREE OPTION BOT
 OPTION COLLECTOR
 
-Yahoo Finance / yfinance에서
-옵션체인을 수집한다.
+Yahoo Finance / yfinance 옵션체인 수집.
 
-Collector는 데이터 수집만 담당하고
-정규화 및 Greeks 계산은 normalizer.py에 위임한다.
+중요:
+- 만기 판단은 미국 동부시간 기준
+- 이미 지나간 만기는 제외
+- 주말에는 다음 유효 만기 선택
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ import time
 
 from datetime import date, datetime
 from typing import Any
+
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance as yf
@@ -27,6 +30,11 @@ from config import (
 
 from normalizer import (
     normalize_options,
+)
+
+
+US_EASTERN = ZoneInfo(
+    "America/New_York"
 )
 
 
@@ -54,6 +62,17 @@ class OptionCollector:
         )
 
     # ========================================================
+    # US DATE
+    # ========================================================
+
+    @staticmethod
+    def get_us_date() -> date:
+
+        return datetime.now(
+            US_EASTERN
+        ).date()
+
+    # ========================================================
     # CURRENT PRICE
     # ========================================================
 
@@ -73,7 +92,9 @@ class OptionCollector:
 
             if price is not None:
 
-                return float(price)
+                return float(
+                    price
+                )
 
         except Exception:
             pass
@@ -154,14 +175,39 @@ class OptionCollector:
 
                 return []
 
-            return list(options)
+            return list(
+                options
+            )
 
         except Exception:
 
             return []
 
     # ========================================================
-    # NEAREST EXPIRATION
+    # PARSE EXPIRATION
+    # ========================================================
+
+    @staticmethod
+    def parse_expiration(
+        expiration: str,
+    ) -> date | None:
+
+        try:
+
+            return datetime.strptime(
+                expiration,
+                "%Y-%m-%d",
+            ).date()
+
+        except (
+            ValueError,
+            TypeError,
+        ):
+
+            return None
+
+    # ========================================================
+    # NEXT VALID EXPIRATION
     # ========================================================
 
     def get_nearest_expiration(
@@ -177,20 +223,29 @@ class OptionCollector:
 
             return None
 
-        today = date.today()
+        today = (
+            self.get_us_date()
+        )
 
         candidates = []
 
         for expiration in expirations:
 
-            try:
+            exp_date = (
+                self.parse_expiration(
+                    expiration
+                )
+            )
 
-                exp_date = datetime.strptime(
-                    expiration,
-                    "%Y-%m-%d",
-                ).date()
+            if exp_date is None:
 
-            except ValueError:
+                continue
+
+            # ------------------------------------------------
+            # 이미 지난 만기 제거
+            # ------------------------------------------------
+
+            if exp_date < today:
 
                 continue
 
@@ -199,8 +254,13 @@ class OptionCollector:
                 - today
             ).days
 
+            # ------------------------------------------------
+            # 정상적인 평일에는
+            # 오늘/내일 범위 우선
+            # ------------------------------------------------
+
             if (
-                0 <= dte <= max_dte
+                dte <= max_dte
             ):
 
                 candidates.append(
@@ -210,15 +270,62 @@ class OptionCollector:
                     )
                 )
 
-        if not candidates:
+        if candidates:
+
+            candidates.sort(
+                key=lambda x: x[0]
+            )
+
+            return candidates[0][1]
+
+        # ----------------------------------------------------
+        # 주말 / 휴일 대응
+        #
+        # 예:
+        # 한국 토요일
+        # 미국 금요일
+        #
+        # 금요일 만기는 이미 exp_date < today
+        # 다음 월요일을 찾아야 한다.
+        #
+        # max_dte 때문에 월요일이 제외될 수 있으므로
+        # 다음 유효 만기를 fallback으로 선택.
+        # ----------------------------------------------------
+
+        future = []
+
+        for expiration in expirations:
+
+            exp_date = (
+                self.parse_expiration(
+                    expiration
+                )
+            )
+
+            if exp_date is None:
+
+                continue
+
+            if exp_date < today:
+
+                continue
+
+            future.append(
+                (
+                    exp_date,
+                    expiration,
+                )
+            )
+
+        if not future:
 
             return None
 
-        candidates.sort(
+        future.sort(
             key=lambda x: x[0]
         )
 
-        return candidates[0][1]
+        return future[0][1]
 
     # ========================================================
     # FETCH CHAIN
@@ -247,21 +354,21 @@ class OptionCollector:
             chain.puts.copy()
         )
 
-        calls["option_type"] = (
-            "CALL"
-        )
+        calls[
+            "option_type"
+        ] = "CALL"
 
-        puts["option_type"] = (
-            "PUT"
-        )
+        puts[
+            "option_type"
+        ] = "PUT"
 
-        calls["expiration"] = (
-            expiration
-        )
+        calls[
+            "expiration"
+        ] = expiration
 
-        puts["expiration"] = (
-            expiration
-        )
+        puts[
+            "expiration"
+        ] = expiration
 
         return pd.concat(
             [
@@ -331,18 +438,29 @@ class OptionCollector:
 
             return {
                 "success": False,
-                "symbol": self.symbol,
+
+                "symbol":
+                    self.symbol,
+
                 "current_price":
                     current_price,
-                "expiration": None,
-                "DTE": None,
-                "rows": 0,
-                "data": [],
+
+                "expiration":
+                    None,
+
+                "DTE":
+                    None,
+
+                "rows":
+                    0,
+
+                "data":
+                    [],
+
                 "error":
                     (
-                        "No expiration found "
-                        f"within DTE <= "
-                        f"{ONE_DAY_MAX_DTE}"
+                        "No valid future "
+                        "expiration found."
                     ),
             }
 
@@ -352,29 +470,56 @@ class OptionCollector:
             )
         )
 
-        dte = (
-            datetime.strptime(
-                expiration,
-                "%Y-%m-%d",
-            ).date()
-            - date.today()
-        ).days
+        expiration_date = (
+            self.parse_expiration(
+                expiration
+            )
+        )
+
+        today = (
+            self.get_us_date()
+        )
+
+        if expiration_date:
+
+            dte = (
+                expiration_date
+                - today
+            ).days
+
+        else:
+
+            dte = None
 
         return {
-            "success": True,
-            "symbol": self.symbol,
+
+            "success":
+                not data.empty,
+
+            "symbol":
+                self.symbol,
+
             "current_price":
                 current_price,
+
             "expiration":
                 expiration,
-            "DTE": dte,
+
+            "DTE":
+                dte,
+
             "rows":
                 len(data),
+
             "data":
                 data.to_dict(
                     orient="records"
                 ),
-            "error": None,
+
+            "error":
+                None
+                if not data.empty
+                else "Option chain empty.",
         }
 
 
@@ -388,9 +533,7 @@ def main():
         DEFAULT_SYMBOL
     )
 
-    result = (
-        collector.collect_one_day()
-    )
+    print()
 
     print(
         "=" * 70
@@ -404,6 +547,17 @@ def main():
     print(
         "=" * 70
     )
+
+    print(
+        f"US Eastern Date : "
+        f"{collector.get_us_date()}"
+    )
+
+    result = (
+        collector.collect_one_day()
+    )
+
+    print()
 
     print(
         f"Symbol        : "
@@ -470,30 +624,48 @@ def main():
         )
 
         columns = [
+
             "symbol",
+
             "expiration",
+
             "DTE",
+
             "option_type",
+
             "strike",
+
             "lastPrice",
+
             "bid",
+
             "ask",
+
             "volume",
+
             "openInterest",
+
             "impliedVolatility",
+
             "delta",
+
             "gamma",
+
             "vega",
+
             "theta",
+
+        ]
+
+        columns = [
+            c
+            for c in columns
+            if c in df.columns
         ]
 
         print(
             df[
-                [
-                    c
-                    for c in columns
-                    if c in df.columns
-                ]
+                columns
             ]
             .head(10)
             .to_string(
@@ -514,6 +686,8 @@ def main():
             f"Gamma rows > 0 : "
             f"{gamma_rows}"
         )
+
+    print()
 
     print(
         "=" * 70
