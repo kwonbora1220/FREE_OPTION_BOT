@@ -705,20 +705,20 @@ def print_report(
         )
 
         print(
-            f"  Volume : "
-            f"{price(item['volume_strike'])} "
+            f"  Volume Strike : "
+            f"{item['volume_strike']:.2f} "
             f"({number(item['volume'])})"
         )
 
         print(
-            f"  OI     : "
-            f"{price(item['oi_strike'])} "
+            f"  OI Strike     : "
+            f"{item['oi_strike']:.2f} "
             f"({number(item['oi'])})"
         )
 
         print(
-            f"  Premium: "
-            f"{price(item['premium_strike'])} "
+            f"  Premium Strike: "
+            f"{item['premium_strike']:.2f} "
             f"({money(item['premium'])})"
         )
 
