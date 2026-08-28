@@ -1,33 +1,41 @@
 """
 FREE OPTION BOT
-Normalizer
+OPTION DATA NORMALIZER
 
-Collector가 Yahoo Finance에서 받은 원본 옵션 데이터를
-BOT 내부에서 사용할 표준 데이터 구조로 정리한다.
+Collector에서 받은 Yahoo Finance 옵션 데이터를
+분석 모듈에서 사용할 수 있는 표준 형태로 정규화한다.
 
-원칙:
-- 원본 데이터 훼손 최소화
-- 숫자형 강제 변환
-- NaN / inf 정리
-- CALL / PUT 구분
-- 기본 품질 검사
+중요 컬럼:
+- symbol
+- expiration
+- DTE
+- option_type
+- strike
+- lastPrice
+- bid
+- ask
+- volume
+- openInterest
+- impliedVolatility
+- delta
+- gamma
+- vega
+- underlying_price
 """
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import pandas as pd
 
 
 # ============================================================
-# STANDARD COLUMNS
+# REQUIRED COLUMNS
 # ============================================================
 
-STANDARD_COLUMNS = [
+REQUIRED_COLUMNS = [
     "symbol",
-    "contractSymbol",
     "expiration",
     "DTE",
     "option_type",
@@ -35,15 +43,19 @@ STANDARD_COLUMNS = [
     "lastPrice",
     "bid",
     "ask",
-    "midPrice",
     "volume",
     "openInterest",
     "impliedVolatility",
-    "premium",
+    "delta",
+    "gamma",
+    "vega",
     "underlying_price",
-    "moneyness",
 ]
 
+
+# ============================================================
+# NUMERIC COLUMNS
+# ============================================================
 
 NUMERIC_COLUMNS = [
     "DTE",
@@ -51,467 +63,541 @@ NUMERIC_COLUMNS = [
     "lastPrice",
     "bid",
     "ask",
-    "midPrice",
     "volume",
     "openInterest",
     "impliedVolatility",
-    "premium",
+    "delta",
+    "gamma",
+    "vega",
     "underlying_price",
-    "moneyness",
 ]
-
-
-# ============================================================
-# UTILITIES
-# ============================================================
-
-def clean_numeric(
-    series: pd.Series,
-) -> pd.Series:
-    """
-    숫자형 변환 + inf 제거.
-    """
-
-    result = pd.to_numeric(
-        series,
-        errors="coerce",
-    )
-
-    result = result.replace(
-        [float("inf"), float("-inf")],
-        pd.NA,
-    )
-
-    return result
-
-
-def safe_number(
-    value: Any,
-) -> float | None:
-    """
-    단일 값을 안전하게 float 변환.
-    """
-
-    if value is None:
-        return None
-
-    try:
-
-        result = float(value)
-
-        if math.isnan(result):
-            return None
-
-        if math.isinf(result):
-            return None
-
-        return result
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        return None
 
 
 # ============================================================
 # NORMALIZER
 # ============================================================
 
-class OptionNormalizer:
-    """
-    옵션 데이터 표준화 클래스.
-    """
-
-    def normalize(
-        self,
-        df: pd.DataFrame,
-    ) -> pd.DataFrame:
-        """
-        Collector 결과를 표준 DataFrame으로 변환한다.
-        """
-
-        if df is None or df.empty:
-
-            return pd.DataFrame(
-                columns=STANDARD_COLUMNS
-            )
-
-        result = df.copy()
-
-        # ----------------------------------------------------
-        # Ensure columns
-        # ----------------------------------------------------
-
-        for column in STANDARD_COLUMNS:
-
-            if column not in result.columns:
-
-                result[column] = pd.NA
-
-        # ----------------------------------------------------
-        # String normalization
-        # ----------------------------------------------------
-
-        if "symbol" in result.columns:
-
-            result["symbol"] = (
-                result["symbol"]
-                .astype("string")
-                .str.upper()
-                .str.strip()
-            )
-
-        if "option_type" in result.columns:
-
-            result["option_type"] = (
-                result["option_type"]
-                .astype("string")
-                .str.upper()
-                .str.strip()
-            )
-
-        if "contractSymbol" in result.columns:
-
-            result["contractSymbol"] = (
-                result["contractSymbol"]
-                .astype("string")
-                .str.strip()
-            )
-
-        if "expiration" in result.columns:
-
-            result["expiration"] = (
-                result["expiration"]
-                .astype("string")
-                .str.strip()
-            )
-
-        # ----------------------------------------------------
-        # Numeric normalization
-        # ----------------------------------------------------
-
-        for column in NUMERIC_COLUMNS:
-
-            result[column] = clean_numeric(
-                result[column]
-            )
-
-        # ----------------------------------------------------
-        # Option type validation
-        # ----------------------------------------------------
-
-        result = result[
-            result["option_type"].isin(
-                [
-                    "CALL",
-                    "PUT",
-                ]
-            )
-        ].copy()
-
-        # ----------------------------------------------------
-        # Strike validation
-        # ----------------------------------------------------
-
-        result = result[
-            result["strike"].notna()
-            & (result["strike"] > 0)
-        ].copy()
-
-        # ----------------------------------------------------
-        # Volume / OI cleanup
-        # ----------------------------------------------------
-
-        result["volume"] = (
-            result["volume"]
-            .fillna(0)
-            .clip(lower=0)
-        )
-
-        result["openInterest"] = (
-            result["openInterest"]
-            .fillna(0)
-            .clip(lower=0)
-        )
-
-        # ----------------------------------------------------
-        # Bid / Ask cleanup
-        # ----------------------------------------------------
-
-        result["bid"] = (
-            result["bid"]
-            .fillna(0)
-            .clip(lower=0)
-        )
-
-        result["ask"] = (
-            result["ask"]
-            .fillna(0)
-            .clip(lower=0)
-        )
-
-        result["lastPrice"] = (
-            result["lastPrice"]
-            .fillna(0)
-            .clip(lower=0)
-        )
-
-        # ----------------------------------------------------
-        # Mid price
-        # ----------------------------------------------------
-
-        calculated_mid = (
-            result["bid"]
-            + result["ask"]
-        ) / 2
-
-        # bid/ask 둘 다 0이면 lastPrice 사용
-        result["midPrice"] = calculated_mid
-
-        invalid_mid = (
-            result["midPrice"].isna()
-            | (result["midPrice"] <= 0)
-        )
-
-        result.loc[
-            invalid_mid,
-            "midPrice",
-        ] = result.loc[
-            invalid_mid,
-            "lastPrice",
-        ]
-
-        result["midPrice"] = (
-            result["midPrice"]
-            .fillna(0)
-            .clip(lower=0)
-        )
-
-        # ----------------------------------------------------
-        # Premium
-        # ----------------------------------------------------
-
-        # 옵션 1계약 = 100주
-        result["premium"] = (
-            result["midPrice"]
-            * result["volume"]
-            * 100
-        )
-
-        # ----------------------------------------------------
-        # Moneyness
-        # ----------------------------------------------------
-
-        valid_underlying = (
-            result["underlying_price"].notna()
-            & (result["underlying_price"] > 0)
-        )
-
-        result["moneyness"] = pd.NA
-
-        result.loc[
-            valid_underlying,
-            "moneyness",
-        ] = (
-            result.loc[
-                valid_underlying,
-                "strike",
-            ]
-            / result.loc[
-                valid_underlying,
-                "underlying_price",
-            ]
-        )
-
-        # ----------------------------------------------------
-        # Remove impossible values
-        # ----------------------------------------------------
-
-        result["impliedVolatility"] = (
-            result["impliedVolatility"]
-            .where(
-                result["impliedVolatility"] >= 0
-            )
-        )
-
-        # ----------------------------------------------------
-        # Sort
-        # ----------------------------------------------------
-
-        result = result.sort_values(
-            by=[
-                "option_type",
-                "strike",
-            ],
-            ascending=[
-                True,
-                True,
-            ],
-        )
-
-        # ----------------------------------------------------
-        # Reset index
-        # ----------------------------------------------------
-
-        result = result.reset_index(
-            drop=True
-        )
-
-        # ----------------------------------------------------
-        # Standard column order
-        # ----------------------------------------------------
-
-        result = result[
-            STANDARD_COLUMNS
-        ]
-
-        return result
-
-
-# ============================================================
-# QUALITY REPORT
-# ============================================================
-
-def build_quality_report(
+def normalize_options(
     df: pd.DataFrame,
-) -> dict[str, Any]:
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
-    표준화된 옵션 데이터의 기본 품질을 계산한다.
+    Collector DataFrame을 표준 옵션 데이터로 변환한다.
+
+    Returns
+    -------
+    normalized_df
+    quality
     """
 
     if df is None or df.empty:
 
-        return {
+        quality = {
             "quality": "LOW",
             "score": 0,
             "rows": 0,
-            "calls": 0,
-            "puts": 0,
-            "missing_volume": 0,
-            "missing_oi": 0,
-            "missing_price": 0,
+            "missing_columns": REQUIRED_COLUMNS,
+            "gamma_available": False,
         }
 
-    rows = len(df)
+        return (
+            pd.DataFrame(
+                columns=REQUIRED_COLUMNS
+            ),
+            quality,
+        )
 
-    calls = int(
+    result = df.copy()
+
+    # ========================================================
+    # COLUMN NAME NORMALIZATION
+    # ========================================================
+
+    rename_map = {
+        # common aliases
+        "type": "option_type",
+        "optionType": "option_type",
+        "option_type": "option_type",
+
+        "open_interest": "openInterest",
+        "openinterest": "openInterest",
+        "oi": "openInterest",
+
+        "last": "lastPrice",
+        "last_price": "lastPrice",
+
+        "implied_volatility":
+            "impliedVolatility",
+
+        "underlyingPrice":
+            "underlying_price",
+
+        "underlying_price":
+            "underlying_price",
+
+        # Greeks
+        "Delta": "delta",
+        "Gamma": "gamma",
+        "Vega": "vega",
+
+        "delta": "delta",
+        "gamma": "gamma",
+        "vega": "vega",
+    }
+
+    result = result.rename(
+        columns=rename_map
+    )
+
+    # ========================================================
+    # ENSURE REQUIRED COLUMNS
+    # ========================================================
+
+    for column in REQUIRED_COLUMNS:
+
+        if column not in result.columns:
+
+            result[column] = pd.NA
+
+    # ========================================================
+    # OPTION TYPE
+    # ========================================================
+
+    result["option_type"] = (
+        result["option_type"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
+
+    # Handle common Yahoo representations
+
+    result["option_type"] = (
+        result["option_type"]
+        .replace(
+            {
+                "C": "CALL",
+                "CALLS": "CALL",
+                "P": "PUT",
+                "PUTS": "PUT",
+            }
+        )
+    )
+
+    # ========================================================
+    # NUMERIC CONVERSION
+    # ========================================================
+
+    for column in NUMERIC_COLUMNS:
+
+        result[column] = pd.to_numeric(
+            result[column],
+            errors="coerce",
+        )
+
+    # ========================================================
+    # DEFAULT NUMERIC VALUES
+    # ========================================================
+
+    # These fields may legitimately be missing
+    # in some Yahoo chains.
+
+    for column in [
+        "DTE",
+        "lastPrice",
+        "bid",
+        "ask",
+        "volume",
+        "openInterest",
+        "impliedVolatility",
+        "delta",
+        "gamma",
+        "vega",
+    ]:
+
+        result[column] = (
+            result[column]
+            .fillna(0)
+        )
+
+    # ========================================================
+    # NEGATIVE VALUES
+    # ========================================================
+
+    result["volume"] = (
+        result["volume"]
+        .clip(lower=0)
+    )
+
+    result["openInterest"] = (
+        result["openInterest"]
+        .clip(lower=0)
+    )
+
+    result["gamma"] = (
+        result["gamma"]
+        .clip(lower=0)
+    )
+
+    result["vega"] = (
+        result["vega"]
+        .clip(lower=0)
+    )
+
+    # ========================================================
+    # IV NORMALIZATION
+    # ========================================================
+
+    # Yahoo can return IV either as:
+    #
+    # 0.36
+    #
+    # or
+    #
+    # 36
+    #
+    # Keep internal representation as decimal.
+
+    iv_mask = (
+        result["impliedVolatility"]
+        > 5
+    )
+
+    result.loc[
+        iv_mask,
+        "impliedVolatility",
+    ] = (
+        result.loc[
+            iv_mask,
+            "impliedVolatility",
+        ]
+        / 100
+    )
+
+    # ========================================================
+    # EXPIRATION
+    # ========================================================
+
+    if "expiration" in result.columns:
+
+        result["expiration"] = (
+            result["expiration"]
+            .astype(str)
+        )
+
+    # ========================================================
+    # SORT
+    # ========================================================
+
+    result = result[
+        result["strike"]
+        .notna()
+    ].copy()
+
+    result = result[
+        result["option_type"].isin(
+            [
+                "CALL",
+                "PUT",
+            ]
+        )
+    ].copy()
+
+    result = result.sort_values(
+        [
+            "option_type",
+            "strike",
+        ]
+    )
+
+    result = result.reset_index(
+        drop=True
+    )
+
+    # ========================================================
+    # QUALITY
+    # ========================================================
+
+    rows = len(result)
+
+    if rows == 0:
+
+        quality = {
+            "quality": "LOW",
+            "score": 0,
+            "rows": 0,
+            "missing_columns": [],
+            "gamma_available": False,
+            "gamma_nonzero_rows": 0,
+        }
+
+        return (
+            result,
+            quality,
+        )
+
+    # --------------------------------------------------------
+    # Gamma quality
+    # --------------------------------------------------------
+
+    gamma_nonzero = int(
         (
-            df["option_type"]
-            == "CALL"
+            result["gamma"]
+            > 0
         ).sum()
     )
 
-    puts = int(
-        (
-            df["option_type"]
-            == "PUT"
-        ).sum()
+    gamma_available = (
+        gamma_nonzero > 0
     )
 
-    missing_volume = int(
-        df["volume"]
-        .isna()
-        .sum()
-    )
-
-    missing_oi = int(
-        df["openInterest"]
-        .isna()
-        .sum()
-    )
-
-    missing_price = int(
-        (
-            df["midPrice"]
-            <= 0
-        ).sum()
+    gamma_ratio = (
+        gamma_nonzero / rows
     )
 
     # --------------------------------------------------------
-    # Score
+    # OI quality
     # --------------------------------------------------------
 
-    score = 100
+    oi_nonzero = int(
+        (
+            result["openInterest"]
+            > 0
+        ).sum()
+    )
 
-    if rows < 20:
-        score -= 30
+    oi_ratio = (
+        oi_nonzero / rows
+    )
 
-    if calls == 0:
-        score -= 25
+    # --------------------------------------------------------
+    # Volume quality
+    # --------------------------------------------------------
 
-    if puts == 0:
-        score -= 25
+    volume_nonzero = int(
+        (
+            result["volume"]
+            > 0
+        ).sum()
+    )
 
-    if missing_volume > 0:
-        score -= min(
-            10,
-            missing_volume
-        )
+    volume_ratio = (
+        volume_nonzero / rows
+    )
 
-    if missing_oi > 0:
-        score -= min(
-            10,
-            missing_oi
-        )
+    # --------------------------------------------------------
+    # IV quality
+    # --------------------------------------------------------
 
-    if missing_price > 0:
-        score -= min(
-            10,
-            missing_price
-        )
+    iv_nonzero = int(
+        (
+            result["impliedVolatility"]
+            > 0
+        ).sum()
+    )
+
+    iv_ratio = (
+        iv_nonzero / rows
+    )
+
+    # ========================================================
+    # SCORE
+    # ========================================================
+
+    score = 0
+
+    score += int(
+        gamma_ratio * 30
+    )
+
+    score += int(
+        oi_ratio * 25
+    )
+
+    score += int(
+        volume_ratio * 20
+    )
+
+    score += int(
+        iv_ratio * 15
+    )
+
+    price_available = int(
+        (
+            result["underlying_price"]
+            > 0
+        ).sum()
+        > 0
+    )
+
+    score += (
+        10
+        if price_available
+        else 0
+    )
 
     score = max(
         0,
-        score,
-    )
-
-    if score >= 90:
-        quality = "HIGH"
-
-    elif score >= 70:
-        quality = "MEDIUM"
-
-    else:
-        quality = "LOW"
-
-    return {
-        "quality": quality,
-        "score": score,
-        "rows": rows,
-        "calls": calls,
-        "puts": puts,
-        "missing_volume": missing_volume,
-        "missing_oi": missing_oi,
-        "missing_price": missing_price,
-    }
-
-
-# ============================================================
-# CONVENIENCE FUNCTION
-# ============================================================
-
-def normalize_options(
-    df: pd.DataFrame,
-) -> tuple[
-    pd.DataFrame,
-    dict[str, Any],
-]:
-
-    normalizer = OptionNormalizer()
-
-    normalized = (
-        normalizer.normalize(df)
-    )
-
-    quality = (
-        build_quality_report(
-            normalized
+        min(
+            100,
+            score,
         )
     )
 
+    if score >= 85:
+
+        quality_label = "HIGH"
+
+    elif score >= 60:
+
+        quality_label = "MEDIUM"
+
+    else:
+
+        quality_label = "LOW"
+
+    # ========================================================
+    # QUALITY RESULT
+    # ========================================================
+
+    quality = {
+        "quality": quality_label,
+        "score": score,
+        "rows": rows,
+
+        "gamma_available":
+            gamma_available,
+
+        "gamma_nonzero_rows":
+            gamma_nonzero,
+
+        "gamma_ratio":
+            gamma_ratio,
+
+        "oi_nonzero_rows":
+            oi_nonzero,
+
+        "oi_ratio":
+            oi_ratio,
+
+        "volume_nonzero_rows":
+            volume_nonzero,
+
+        "volume_ratio":
+            volume_ratio,
+
+        "iv_nonzero_rows":
+            iv_nonzero,
+
+        "iv_ratio":
+            iv_ratio,
+
+        "underlying_price_available":
+            bool(price_available),
+
+        "missing_columns": [
+            column
+            for column in REQUIRED_COLUMNS
+            if column not in df.columns
+        ],
+    }
+
     return (
-        normalized,
+        result,
         quality,
     )
+
+
+# ============================================================
+# DEBUG FUNCTION
+# ============================================================
+
+def print_normalizer_debug(
+    df: pd.DataFrame,
+    quality: dict[str, Any],
+) -> None:
+    """
+    Greeks가 제대로 전달되는지 확인하기 위한
+    디버그 출력.
+    """
+
+    print()
+    print(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    print(
+        "🔍 NORMALIZER DEBUG"
+    )
+
+    print(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    print(
+        f"Rows           : "
+        f"{len(df):,}"
+    )
+
+    print(
+        f"Gamma rows > 0 : "
+        f"{quality.get('gamma_nonzero_rows', 0):,}"
+    )
+
+    print(
+        f"Gamma ratio    : "
+        f"{quality.get('gamma_ratio', 0) * 100:.1f}%"
+    )
+
+    print(
+        f"OI rows > 0    : "
+        f"{quality.get('oi_nonzero_rows', 0):,}"
+    )
+
+    print(
+        f"Volume rows >0 : "
+        f"{quality.get('volume_nonzero_rows', 0):,}"
+    )
+
+    print()
+
+    print(
+        "SAMPLE GREEKS"
+    )
+
+    print(
+        "-" * 70
+    )
+
+    columns = [
+        "option_type",
+        "strike",
+        "openInterest",
+        "impliedVolatility",
+        "delta",
+        "gamma",
+        "vega",
+    ]
+
+    available = [
+        column
+        for column in columns
+        if column in df.columns
+    ]
+
+    if not df.empty:
+
+        print(
+            df[
+                available
+            ]
+            .head(10)
+            .to_string(
+                index=False
+            )
+        )
+
+    print(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    print()
