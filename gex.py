@@ -1,17 +1,18 @@
 """
-FREE OPTION BOT
-GEX ANALYSIS
+FREE OPTION BOT - GEX ANALYSIS
 
-Gamma × Open Interest 기반 구조적 GEX.
+Gamma × Open Interest 기반 구조적 GEX 분석.
 
-CALL:
-    +Gamma × OI × 100 × Spot² × 0.01
+CALL GEX:
+    Gamma × Open Interest × 100 × Spot² × 0.01
 
-PUT:
-    -Gamma × OI × 100 × Spot² × 0.01
+PUT GEX:
+    -Gamma × Open Interest × 100 × Spot² × 0.01
 
 주의:
-GEX는 실제 딜러/기관 포지션을 직접 관측하지 않는다.
+- GEX는 실제 딜러/기관 포지션을 직접 관측하지 않는다.
+- 무료 데이터 기반 구조적 추정치다.
+- 0DTE에서는 Gamma가 급격하게 변할 수 있다.
 """
 
 from __future__ import annotations
@@ -21,15 +22,8 @@ from typing import Any
 import pandas as pd
 
 from config import DEFAULT_SYMBOL
-
-from option_collector import (
-    OptionCollector,
-)
-
-from normalizer import (
-    normalize_options,
-    print_normalizer_debug,
-)
+from option_collector import OptionCollector
+from normalizer import normalize_options, print_normalizer_debug
 
 
 # ============================================================
@@ -37,63 +31,36 @@ from normalizer import (
 # ============================================================
 
 CONTRACT_MULTIPLIER = 100
-
 GEX_PERCENT_MOVE = 0.01
-
 NEAR_SPOT_COUNT = 9
 
 
 # ============================================================
-# FORMAT
+# FORMATTERS
 # ============================================================
 
-def format_price(
-    value: float | None,
-) -> str:
-
+def format_price(value: float | None) -> str:
     if value is None:
         return "N/A"
 
     return f"${value:,.2f}"
 
 
-def format_gex(
-    value: float,
-) -> str:
-
-    sign = (
-        "+"
-        if value > 0
-        else ""
-    )
+def format_gex(value: float) -> str:
+    sign = "+" if value > 0 else ""
 
     absolute = abs(value)
 
     if absolute >= 1_000_000_000:
-
-        return (
-            f"{sign}"
-            f"{value / 1_000_000_000:.2f}B"
-        )
+        return f"{sign}{value / 1_000_000_000:.2f}B"
 
     if absolute >= 1_000_000:
-
-        return (
-            f"{sign}"
-            f"{value / 1_000_000:.2f}M"
-        )
+        return f"{sign}{value / 1_000_000:.2f}M"
 
     if absolute >= 1_000:
+        return f"{sign}{value / 1_000:.2f}K"
 
-        return (
-            f"{sign}"
-            f"{value / 1_000:.2f}K"
-        )
-
-    return (
-        f"{sign}"
-        f"{value:.0f}"
-    )
+    return f"{sign}{value:.0f}"
 
 
 # ============================================================
@@ -107,12 +74,8 @@ class GEXCalculator:
         df: pd.DataFrame,
         current_price: float | None = None,
     ):
-
         self.df = df.copy()
-
-        self.current_price = (
-            current_price
-        )
+        self.current_price = current_price
 
         self._prepare()
 
@@ -125,18 +88,21 @@ class GEXCalculator:
         if self.df.empty:
             return
 
-        required = [
+        required_columns = [
             "option_type",
             "strike",
             "openInterest",
             "gamma",
         ]
 
-        for column in required:
+        for column in required_columns:
 
             if column not in self.df.columns:
-
                 self.df[column] = 0.0
+
+        # ----------------------------------------------------
+        # NUMERIC
+        # ----------------------------------------------------
 
         self.df["strike"] = pd.to_numeric(
             self.df["strike"],
@@ -152,6 +118,10 @@ class GEXCalculator:
             self.df["gamma"],
             errors="coerce",
         )
+
+        # ----------------------------------------------------
+        # CLEAN
+        # ----------------------------------------------------
 
         self.df["openInterest"] = (
             self.df["openInterest"]
@@ -178,10 +148,7 @@ class GEXCalculator:
 
         self.df = self.df[
             self.df["option_type"].isin(
-                [
-                    "CALL",
-                    "PUT",
-                ]
+                ["CALL", "PUT"]
             )
         ].copy()
 
@@ -192,24 +159,15 @@ class GEXCalculator:
     def _get_spot(self):
 
         if (
-            self.current_price
-            is not None
+            self.current_price is not None
             and self.current_price > 0
         ):
+            return float(self.current_price)
 
-            return float(
-                self.current_price
-            )
-
-        if (
-            "underlying_price"
-            in self.df.columns
-        ):
+        if "underlying_price" in self.df.columns:
 
             prices = pd.to_numeric(
-                self.df[
-                    "underlying_price"
-                ],
+                self.df["underlying_price"],
                 errors="coerce",
             ).dropna()
 
@@ -218,10 +176,7 @@ class GEXCalculator:
             ]
 
             if not prices.empty:
-
-                return float(
-                    prices.iloc[0]
-                )
+                return float(prices.iloc[0])
 
         return None
 
@@ -229,77 +184,113 @@ class GEXCalculator:
     # CALCULATE
     # ========================================================
 
-    def calculate(
-        self,
-    ) -> dict[str, Any]:
+    def calculate(self) -> dict[str, Any]:
 
         spot = self._get_spot()
+
+        # ----------------------------------------------------
+        # EMPTY DATA
+        # ----------------------------------------------------
 
         if self.df.empty:
 
             return {
                 "success": False,
-                "error":
-                    "Empty option data.",
-                "current_price":
-                    spot,
+                "error": "Empty option data.",
+                "current_price": spot,
                 "table": [],
             }
+
+        # ----------------------------------------------------
+        # NO SPOT
+        # ----------------------------------------------------
 
         if spot is None:
 
             return {
                 "success": False,
-                "error":
-                    "Current price unavailable.",
-                "current_price":
-                    None,
+                "error": "Current price unavailable.",
+                "current_price": None,
                 "table": [],
             }
 
+        # ====================================================
+        # DATA QUALITY
+        # ====================================================
+
+        total_rows = len(self.df)
+
         gamma_nonzero = int(
             (
-                self.df["gamma"]
-                > 0
+                self.df["gamma"] > 0
             ).sum()
         )
+
+        gamma_ratio = (
+            gamma_nonzero
+            / total_rows
+            * 100
+            if total_rows > 0
+            else 0.0
+        )
+
+        # ----------------------------------------------------
+        # GAMMA UNAVAILABLE
+        # ----------------------------------------------------
 
         if gamma_nonzero == 0:
 
             return {
                 "success": False,
-
                 "error":
-                    (
-                        "Gamma data is "
-                        "unavailable or all "
-                        "gamma values are zero."
-                    ),
+                    "Gamma data is unavailable "
+                    "or all gamma values are zero.",
 
-                "current_price":
-                    spot,
+                "current_price": spot,
 
                 "table": [],
 
-                "gamma_available":
-                    False,
+                "gamma_available": False,
+
+                "gamma_nonzero_rows":
+                    gamma_nonzero,
+
+                "total_rows":
+                    total_rows,
+
+                "strike_rows":
+                    int(
+                        self.df["strike"].nunique()
+                    ),
+
+                "gamma_ratio":
+                    gamma_ratio,
             }
 
-        # ----------------------------------------------------
+        # ====================================================
         # GEX BASE
-        # ----------------------------------------------------
+        # ====================================================
 
         self.df["gex_base"] = (
+
             self.df["gamma"]
+
             * self.df["openInterest"]
+
             * CONTRACT_MULTIPLIER
-            * (
-                spot ** 2
-            )
+
+            * (spot ** 2)
+
             * GEX_PERCENT_MOVE
+
         )
 
+        # ====================================================
+        # CALL / PUT GEX
+        # ====================================================
+
         self.df["call_gex"] = 0.0
+
         self.df["put_gex"] = 0.0
 
         call_mask = (
@@ -314,23 +305,23 @@ class GEXCalculator:
 
         self.df.loc[
             call_mask,
-            "call_gex",
+            "call_gex"
         ] = self.df.loc[
             call_mask,
-            "gex_base",
+            "gex_base"
         ]
 
         self.df.loc[
             put_mask,
-            "put_gex",
+            "put_gex"
         ] = -self.df.loc[
             put_mask,
-            "gex_base",
+            "gex_base"
         ]
 
-        # ----------------------------------------------------
+        # ====================================================
         # STRIKE AGGREGATION
-        # ----------------------------------------------------
+        # ====================================================
 
         result = (
             self.df
@@ -353,34 +344,24 @@ class GEXCalculator:
 
         result = (
             result
-            .sort_values(
-                "strike"
-            )
-            .reset_index(
-                drop=True
-            )
+            .sort_values("strike")
+            .reset_index(drop=True)
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # DISTANCE
-        # ----------------------------------------------------
+        # ====================================================
 
         result["distance"] = (
             result["strike"]
             - spot
         )
 
-        result[
-            "distance_percent"
-        ] = (
+        result["distance_percent"] = (
             result["distance"]
             / spot
             * 100.0
         )
-
-        # ----------------------------------------------------
-        # SIGN
-        # ----------------------------------------------------
 
         result["gex_sign"] = (
             result["net_gex"]
@@ -396,103 +377,94 @@ class GEXCalculator:
             )
         )
 
-        # ----------------------------------------------------
-        # TOTAL
-        # ----------------------------------------------------
+        # ====================================================
+        # TOTAL GEX
+        # ====================================================
 
         total_call_gex = float(
-            result[
-                "call_gex"
-            ].sum()
+            result["call_gex"].sum()
         )
 
         total_put_gex = float(
-            result[
-                "put_gex"
-            ].sum()
+            result["put_gex"].sum()
         )
 
         total_net_gex = float(
-            result[
-                "net_gex"
-            ].sum()
+            result["net_gex"].sum()
         )
 
-        # ----------------------------------------------------
-        # EXTREMES
-        # ----------------------------------------------------
+        # ====================================================
+        # POSITIVE / NEGATIVE
+        # ====================================================
 
         positive = result[
             result["net_gex"] > 0
-        ]
+        ].copy()
 
         negative = result[
             result["net_gex"] < 0
-        ]
+        ].copy()
+
+        # ====================================================
+        # MAX POSITIVE
+        # ====================================================
 
         max_positive = None
-        max_negative = None
 
         if not positive.empty:
 
             row = positive.loc[
-                positive[
-                    "net_gex"
-                ].idxmax()
+                positive["net_gex"].idxmax()
             ]
 
             max_positive = {
+
                 "strike":
-                    float(
-                        row["strike"]
-                    ),
+                    float(row["strike"]),
 
                 "net_gex":
-                    float(
-                        row["net_gex"]
-                    ),
+                    float(row["net_gex"]),
             }
+
+        # ====================================================
+        # MAX NEGATIVE
+        # ====================================================
+
+        max_negative = None
 
         if not negative.empty:
 
             row = negative.loc[
-                negative[
-                    "net_gex"
-                ].idxmin()
+                negative["net_gex"].idxmin()
             ]
 
             max_negative = {
+
                 "strike":
-                    float(
-                        row["strike"]
-                    ),
+                    float(row["strike"]),
 
                 "net_gex":
-                    float(
-                        row["net_gex"]
-                    ),
+                    float(row["net_gex"]),
             }
 
-        # ----------------------------------------------------
+        # ====================================================
         # GEX FLIP
-        # ----------------------------------------------------
+        # ====================================================
 
-        flip = (
-            self._find_gex_flip(
-                result
-            )
+        flip = self._find_gex_flip(
+            result
         )
 
-        # ----------------------------------------------------
-        # TOP ABSOLUTE
-        # ----------------------------------------------------
+        # ====================================================
+        # TOP ABSOLUTE GEX
+        # ====================================================
 
         top_absolute = (
-            result.assign(
+
+            result
+            .assign(
                 abs_gex=
-                    result[
-                        "net_gex"
-                    ].abs()
+                    result["net_gex"].abs()
             )
             .sort_values(
                 "abs_gex",
@@ -500,20 +472,17 @@ class GEXCalculator:
             )
             .head(10)
             .drop(
-                columns=[
-                    "abs_gex"
-                ]
+                columns=["abs_gex"]
             )
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # TOP POSITIVE
-        # ----------------------------------------------------
+        # ====================================================
 
         top_positive = (
-            result[
-                result["net_gex"] > 0
-            ]
+
+            positive
             .sort_values(
                 "net_gex",
                 ascending=False,
@@ -521,14 +490,13 @@ class GEXCalculator:
             .head(5)
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # TOP NEGATIVE
-        # ----------------------------------------------------
+        # ====================================================
 
         top_negative = (
-            result[
-                result["net_gex"] < 0
-            ]
+
+            negative
             .sort_values(
                 "net_gex",
                 ascending=True,
@@ -536,20 +504,36 @@ class GEXCalculator:
             .head(5)
         )
 
+        # ====================================================
+        # RETURN
+        # ====================================================
+
         return {
 
-            "success":
-                True,
+            "success": True,
 
             "current_price":
                 spot,
 
+            # DATA QUALITY
             "gamma_available":
                 True,
+
+            "total_rows":
+                total_rows,
 
             "gamma_nonzero_rows":
                 gamma_nonzero,
 
+            "strike_rows":
+                int(
+                    result["strike"].nunique()
+                ),
+
+            "gamma_ratio":
+                gamma_ratio,
+
+            # GEX
             "total_call_gex":
                 total_call_gex,
 
@@ -559,15 +543,18 @@ class GEXCalculator:
             "total_net_gex":
                 total_net_gex,
 
+            # EXTREMES
             "max_positive":
                 max_positive,
 
             "max_negative":
                 max_negative,
 
+            # FLIP
             "gex_flip":
                 flip,
 
+            # TABLE
             "table":
                 result.to_dict(
                     orient="records"
@@ -619,23 +606,22 @@ class GEXCalculator:
                 continue
 
             prev_gex = float(
-                previous[
-                    "net_gex"
-                ]
+                previous["net_gex"]
             )
 
             curr_gex = float(
-                row[
-                    "net_gex"
-                ]
+                row["net_gex"]
             )
 
             crossed = (
+
                 (
                     prev_gex < 0
                     and curr_gex > 0
                 )
+
                 or
+
                 (
                     prev_gex > 0
                     and curr_gex < 0
@@ -645,15 +631,11 @@ class GEXCalculator:
             if crossed:
 
                 lower = float(
-                    previous[
-                        "strike"
-                    ]
+                    previous["strike"]
                 )
 
                 upper = float(
-                    row[
-                        "strike"
-                    ]
+                    row["strike"]
                 )
 
                 denominator = (
@@ -664,14 +646,20 @@ class GEXCalculator:
                 if denominator != 0:
 
                     flip = (
+
                         lower
+
                         + (
+
                             -prev_gex
                             / denominator
+
                         )
                         * (
+
                             upper
                             - lower
+
                         )
                     )
 
@@ -705,26 +693,22 @@ class GEXCalculator:
     # NEAR SPOT
     # ========================================================
 
+    @staticmethod
     def near_spot(
-        self,
         result: dict[str, Any],
         count: int = NEAR_SPOT_COUNT,
     ):
 
         table = result.get(
             "table",
-            [],
+            []
         )
 
         spot = result.get(
             "current_price"
         )
 
-        if (
-            not table
-            or spot is None
-        ):
-
+        if not table or spot is None:
             return []
 
         return sorted(
@@ -742,7 +726,7 @@ class GEXCalculator:
 # ============================================================
 
 def print_report(
-    result: dict[str, Any],
+    result: dict[str, Any]
 ) -> None:
 
     print()
@@ -751,13 +735,15 @@ def print_report(
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
-    print(
-        "⚡ GEX ANALYSIS"
-    )
+    print("⚡ GEX ANALYSIS")
 
     print(
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
+
+    # ========================================================
+    # FAILURE
+    # ========================================================
 
     if not result["success"]:
 
@@ -772,13 +758,35 @@ def print_report(
 
         return
 
+    # ========================================================
+    # BASIC
+    # ========================================================
+
     spot = result[
         "current_price"
     ]
 
-    # --------------------------------------------------------
-    # CURRENT
-    # --------------------------------------------------------
+    net = result[
+        "total_net_gex"
+    ]
+
+    if net > 0:
+
+        structure = (
+            "🟢 POSITIVE GEX"
+        )
+
+    elif net < 0:
+
+        structure = (
+            "🔴 NEGATIVE GEX"
+        )
+
+    else:
+
+        structure = (
+            "🟡 NEUTRAL GEX"
+        )
 
     print(
         f"💰 Current Price : "
@@ -787,13 +795,11 @@ def print_report(
 
     print()
 
-    # --------------------------------------------------------
+    # ========================================================
     # TOTAL GEX
-    # --------------------------------------------------------
+    # ========================================================
 
-    print(
-        "⚡ TOTAL GEX"
-    )
+    print("⚡ TOTAL GEX")
 
     print(
         f"CALL GEX : "
@@ -807,58 +813,27 @@ def print_report(
 
     print(
         f"NET GEX  : "
-        f"{format_gex(result['total_net_gex'])}"
+        f"{format_gex(net)}"
     )
 
-    if (
-        result["total_net_gex"]
-        > 0
-    ):
-
-        print(
-            "STRUCTURE: 🟢 POSITIVE GEX"
-        )
-
-    elif (
-        result["total_net_gex"]
-        < 0
-    ):
-
-        print(
-            "STRUCTURE: 🔴 NEGATIVE GEX"
-        )
-
-    else:
-
-        print(
-            "STRUCTURE: 🟡 NEUTRAL GEX"
-        )
-
-    # --------------------------------------------------------
-    # FLIP
-    # --------------------------------------------------------
+    print(
+        f"STRUCTURE: "
+        f"{structure}"
+    )
 
     print()
 
-    print(
-        "🔄 GEX FLIP"
-    )
+    # ========================================================
+    # FLIP
+    # ========================================================
+
+    print("🔄 GEX FLIP")
 
     flip = result.get(
         "gex_flip"
     )
 
-    if flip is None:
-
-        print(
-            "GEX Flip : N/A"
-        )
-
-        print(
-            "Range    : N/A"
-        )
-
-    else:
+    if flip:
 
         print(
             f"GEX Flip : "
@@ -872,31 +847,35 @@ def print_report(
             f"{format_price(flip['upper_strike'])}"
         )
 
-    # --------------------------------------------------------
-    # EXTREMES
-    # --------------------------------------------------------
+    else:
+
+        print(
+            "GEX Flip : N/A"
+        )
 
     print()
 
-    print(
-        "🔥 GEX EXTREMES"
-    )
+    # ========================================================
+    # EXTREMES
+    # ========================================================
 
-    positive = result.get(
+    print("🔥 GEX EXTREMES")
+
+    pos = result.get(
         "max_positive"
     )
 
-    negative = result.get(
+    neg = result.get(
         "max_negative"
     )
 
-    if positive:
+    if pos:
 
         print(
             f"🟢 Max Positive : "
-            f"{format_price(positive['strike'])}"
+            f"{format_price(pos['strike'])}"
             f" "
-            f"({format_gex(positive['net_gex'])})"
+            f"({format_gex(pos['net_gex'])})"
         )
 
     else:
@@ -905,13 +884,13 @@ def print_report(
             "🟢 Max Positive : N/A"
         )
 
-    if negative:
+    if neg:
 
         print(
             f"🔴 Max Negative : "
-            f"{format_price(negative['strike'])}"
+            f"{format_price(neg['strike'])}"
             f" "
-            f"({format_gex(negative['net_gex'])})"
+            f"({format_gex(neg['net_gex'])})"
         )
 
     else:
@@ -920,174 +899,181 @@ def print_report(
             "🔴 Max Negative : N/A"
         )
 
-    # --------------------------------------------------------
-    # TOP
-    # --------------------------------------------------------
-
     print()
+
+    # ========================================================
+    # TOP GEX
+    # ========================================================
 
     print(
         "🎯 TOP GEX STRIKES"
     )
 
     print(
-        "-" * 70
+        "----------------------------------------------------------------------"
     )
 
-    top = result.get(
-        "top_absolute",
-        [],
-    )
-
-    for number, row in enumerate(
-        top,
-        start=1,
+    for i, row in enumerate(
+        result["top_absolute"],
+        1,
     ):
 
-        net = float(
-            row["net_gex"]
-        )
+        if row["net_gex"] > 0:
 
-        if net > 0:
-            icon = "🟢"
+            emoji = "🟢"
 
-        elif net < 0:
-            icon = "🔴"
+        elif row["net_gex"] < 0:
+
+            emoji = "🔴"
 
         else:
-            icon = "🟡"
+
+            emoji = "🟡"
 
         print(
-            f"{icon} "
-            f"{number:02d}. "
+
+            f"{emoji} "
+
+            f"{i:02d}. "
+
             f"{format_price(row['strike'])}"
-            f" | "
-            f"CALL "
+
+            f" | CALL "
             f"{format_gex(row['call_gex'])}"
-            f" | "
-            f"PUT "
+
+            f" | PUT "
             f"{format_gex(row['put_gex'])}"
-            f" | "
-            f"NET "
-            f"{format_gex(net)}"
+
+            f" | NET "
+            f"{format_gex(row['net_gex'])}"
         )
 
-    # --------------------------------------------------------
-    # NEAR CURRENT PRICE
-    # --------------------------------------------------------
-
     print()
+
+    # ========================================================
+    # NEAR CURRENT PRICE
+    # ========================================================
 
     print(
         "📍 NEAR CURRENT PRICE"
     )
 
     print(
-        "-" * 70
+        "----------------------------------------------------------------------"
     )
 
-    near = sorted(
-        result.get(
-            "table",
-            [],
-        ),
-        key=lambda row:
-            abs(
-                row["strike"]
-                - spot
-            ),
-    )[:NEAR_SPOT_COUNT]
-
-    for row in near:
-
-        net = float(
-            row["net_gex"]
+    near_rows = (
+        GEXCalculator.near_spot(
+            result,
+            NEAR_SPOT_COUNT,
         )
+    )
 
-        if net > 0:
-            icon = "🟢"
+    for row in near_rows:
 
-        elif net < 0:
-            icon = "🔴"
+        if row["net_gex"] > 0:
+
+            emoji = "🟢"
+
+        elif row["net_gex"] < 0:
+
+            emoji = "🔴"
 
         else:
-            icon = "🟡"
+
+            emoji = "🟡"
 
         print(
-            f"{icon} "
-            f"{format_price(row['strike'])}"
-            f" | Net GEX "
-            f"{format_gex(net)}"
-        )
 
-    # --------------------------------------------------------
-    # QUALITY
-    # --------------------------------------------------------
+            f"{emoji} "
+
+            f"{format_price(row['strike'])}"
+
+            f" | Net GEX "
+
+            f"{format_gex(row['net_gex'])}"
+        )
 
     print()
 
-    gamma_rows = result.get(
-        "gamma_nonzero_rows",
-        0,
-    )
-
-    total_rows = len(
-        result.get(
-            "table",
-            [],
-        )
-    )
-
-    if total_rows > 0:
-
-        gamma_ratio = (
-            gamma_rows
-            / max(
-                total_rows,
-                1,
-            )
-            * 100
-        )
-
-    else:
-
-        gamma_ratio = 0.0
+    # ========================================================
+    # DATA QUALITY
+    # ========================================================
 
     print(
         "📊 DATA QUALITY"
     )
 
     print(
-        f"Gamma rows : "
-        f"{gamma_rows}"
+        "----------------------------------------------------------------------"
     )
 
     print(
-        f"Strike rows: "
-        f"{total_rows}"
+        f"Option rows : "
+        f"{result['total_rows']:,}"
     )
 
     print(
-        f"Gamma ratio: "
-        f"{gamma_ratio:.1f}%"
+        f"Gamma rows  : "
+        f"{result['gamma_nonzero_rows']:,}"
     )
 
-    # --------------------------------------------------------
-    # WARNING
-    # --------------------------------------------------------
+    print(
+        f"Strike rows : "
+        f"{result['strike_rows']:,}"
+    )
+
+    print(
+        f"Gamma ratio : "
+        f"{result['gamma_ratio']:.1f}%"
+    )
 
     print()
 
+    # ========================================================
+    # WARNINGS
+    # ========================================================
+
     print(
         "⚠️ GEX is a structural estimate "
-        "based on model-derived "
-        "Gamma × Open Interest."
+        "based on model-derived Gamma × Open Interest."
     )
 
     print(
         "⚠️ It does not directly reveal "
         "dealer or institutional positions."
     )
+
+    # 0DTE WARNING
+    if "DTE" in result.get(
+        "table",
+        [{}]
+    )[0]:
+
+        dtes = [
+            row.get("DTE")
+            for row in result["table"]
+            if row.get("DTE") is not None
+        ]
+
+        if dtes:
+
+            try:
+
+                min_dte = min(
+                    float(x)
+                    for x in dtes
+                )
+
+                if min_dte <= 0:
+
+                    print(
+                        "⚠️ 0DTE GEX can change "
+                        "rapidly near expiration."
+                    )
+
+            except Exception:
+                pass
 
     print(
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -1110,119 +1096,61 @@ def main():
         symbol
     )
 
-    # --------------------------------------------------------
-    # CURRENT PRICE
-    # --------------------------------------------------------
-
-    current_price = (
-        collector.get_current_price()
-    )
+    data = collector.collect()
 
     if (
-        current_price is None
-        or current_price <= 0
+        data is None
+        or data.empty
     ):
 
         print(
-            "❌ Current price unavailable."
+            "❌ No option data collected."
         )
 
         return
 
-    # --------------------------------------------------------
-    # EXPIRATION
-    # --------------------------------------------------------
+    # ========================================================
+    # NORMALIZER
+    # ========================================================
 
-    expiration = (
-        collector.get_nearest_expiration(
-            max_dte=365
-        )
+    normalized = normalize_options(
+        data
     )
 
-    if expiration is None:
-
-        print(
-            "❌ No valid future expiration."
-        )
-
-        return
-
-    print(
-        f"Expiration: "
-        f"{expiration}"
-    )
-
-    # --------------------------------------------------------
-    # RAW CHAIN
-    # --------------------------------------------------------
-
-    try:
-
-        raw = collector.fetch_chain(
-            expiration
-        )
-
-    except Exception as error:
-
-        print(
-            f"❌ Failed to collect "
-            f"option chain: {error}"
-        )
-
-        return
-
-    if raw.empty:
-
-        print(
-            "❌ Option chain empty."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # NORMALIZE
-    # --------------------------------------------------------
-
-    df = normalize_options(
-        raw,
-        current_price,
-    )
-
-    if df.empty:
-
-        print(
-            "❌ Normalized data empty."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # DEBUG
-    # --------------------------------------------------------
+    # ========================================================
+    # NORMALIZER DEBUG
+    # ========================================================
 
     print_normalizer_debug(
-        df
+        normalized
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # GEX
-    # --------------------------------------------------------
+    # ========================================================
 
     calculator = GEXCalculator(
-        df,
-        current_price,
+
+        normalized,
+
+        current_price=
+            collector.current_price,
     )
 
     result = calculator.calculate()
 
-    # --------------------------------------------------------
+    # ========================================================
     # REPORT
-    # --------------------------------------------------------
+    # ========================================================
 
     print_report(
         result
     )
 
+
+# ============================================================
+# ENTRY
+# ============================================================
 
 if __name__ == "__main__":
 
